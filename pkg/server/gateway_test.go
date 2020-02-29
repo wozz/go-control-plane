@@ -23,6 +23,7 @@ import (
 	"testing"
 	"testing/iotest"
 
+	"github.com/envoyproxy/go-control-plane/pkg/apiversions"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/envoyproxy/go-control-plane/pkg/server"
 )
@@ -39,17 +40,20 @@ func (log logger) Errorf(format string, args ...interface{}) { log.t.Logf(format
 func TestGateway(t *testing.T) {
 	config := makeMockConfigWatcher()
 	config.responses = map[string][]cache.Response{
-		cache.ClusterType: []cache.Response{{
-			Version:   "2",
-			Resources: []cache.Resource{cluster},
+		cache.ClusterType[apiversions.V2]: []cache.Response{{
+			Version:    "2",
+			Resources:  []cache.Resource{cluster},
+			APIVersion: apiversions.V2,
 		}},
-		cache.RouteType: []cache.Response{{
-			Version:   "3",
-			Resources: []cache.Resource{route},
+		cache.RouteType[apiversions.V2]: []cache.Response{{
+			Version:    "3",
+			Resources:  []cache.Resource{route},
+			APIVersion: apiversions.V2,
 		}},
-		cache.ListenerType: []cache.Response{{
-			Version:   "4",
-			Resources: []cache.Resource{listener},
+		cache.ListenerType[apiversions.V2]: []cache.Response{{
+			Version:    "4",
+			Resources:  []cache.Resource{listener},
+			APIVersion: apiversions.V2,
 		}},
 	}
 	gtw := server.HTTPGateway{Log: logger{t: t}, Server: server.NewServer(context.Background(), config, nil)}
@@ -97,6 +101,82 @@ func TestGateway(t *testing.T) {
 	}
 
 	for _, path := range []string{"/v2/discovery:clusters", "/v2/discovery:routes", "/v2/discovery:listeners"} {
+		rr := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodPost, path, strings.NewReader("{\"node\": {\"id\": \"test\"}}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		gtw.ServeHTTP(rr, req)
+		if status := rr.Code; status != 200 {
+			t.Errorf("handler returned wrong status: %d, want %d", status, 200)
+		}
+	}
+}
+
+func TestGatewayV3(t *testing.T) {
+	config := makeMockConfigWatcher()
+	config.responses = map[string][]cache.Response{
+		cache.ClusterType[apiversions.V3]: []cache.Response{{
+			Version:    "2",
+			Resources:  []cache.Resource{clusterV3},
+			APIVersion: apiversions.V3,
+		}},
+		cache.RouteType[apiversions.V3]: []cache.Response{{
+			Version:    "3",
+			Resources:  []cache.Resource{routeV3},
+			APIVersion: apiversions.V3,
+		}},
+		cache.ListenerType[apiversions.V3]: []cache.Response{{
+			Version:    "4",
+			Resources:  []cache.Resource{listenerV3},
+			APIVersion: apiversions.V3,
+		}},
+	}
+	gtw := server.HTTPGateway{Log: logger{t: t}, Server: server.NewServer(context.Background(), config, nil)}
+
+	failCases := []struct {
+		path   string
+		body   io.Reader
+		expect int
+	}{
+		{
+			path:   "/hello/",
+			expect: http.StatusNotFound,
+		},
+		{
+			path:   "/v3/discovery:endpoints",
+			expect: http.StatusBadRequest,
+		},
+		{
+			path:   "/v3/discovery:endpoints",
+			body:   iotest.TimeoutReader(strings.NewReader("hello")),
+			expect: http.StatusBadRequest,
+		},
+		{
+			path:   "/v3/discovery:endpoints",
+			body:   strings.NewReader("hello"),
+			expect: http.StatusBadRequest,
+		},
+		{
+			// missing response
+			path:   "/v3/discovery:endpoints",
+			body:   strings.NewReader("{\"node\": {\"id\": \"test\"}}"),
+			expect: http.StatusInternalServerError,
+		},
+	}
+	for _, cs := range failCases {
+		rr := httptest.NewRecorder()
+		req, err := http.NewRequest(http.MethodPost, cs.path, cs.body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gtw.ServeHTTP(rr, req)
+		if status := rr.Code; status != cs.expect {
+			t.Errorf("handler returned wrong status: %d, want %d", status, cs.expect)
+		}
+	}
+
+	for _, path := range []string{"/v3/discovery:clusters", "/v3/discovery:routes", "/v3/discovery:listeners"} {
 		rr := httptest.NewRecorder()
 		req, err := http.NewRequest(http.MethodPost, path, strings.NewReader("{\"node\": {\"id\": \"test\"}}"))
 		if err != nil {

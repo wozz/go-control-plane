@@ -30,9 +30,16 @@ import (
 	listener "github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
 	route "github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	als "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v2"
+	envoy_config_accesslog_v3 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v3"
+	envoy_config_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/config/cluster/v3"
+	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	alf "github.com/envoyproxy/go-control-plane/envoy/config/filter/accesslog/v2"
 	hcm "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 	tcp "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/tcp_proxy/v2"
+	envoy_config_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	envoy_config_route_v3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	envoy_extensions_access_loggers_grpc_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/access_loggers/grpc/v3"
+	hcm_v3 "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
@@ -149,6 +156,37 @@ func configSource(mode string) *core.ConfigSource {
 		source.ConfigSourceSpecifier = &core.ConfigSource_ApiConfigSource{
 			ApiConfigSource: &core.ApiConfigSource{
 				ApiType:      core.ApiConfigSource_REST,
+				ClusterNames: []string{XdsCluster},
+				RefreshDelay: ptypes.DurationProto(RefreshDelay),
+			},
+		}
+	}
+	return source
+}
+
+func configSourceV3(mode string) *envoy_config_core_v3.ConfigSource {
+	source := &envoy_config_core_v3.ConfigSource{}
+	switch mode {
+	case Ads:
+		source.ConfigSourceSpecifier = &envoy_config_core_v3.ConfigSource_Ads{
+			Ads: &envoy_config_core_v3.AggregatedConfigSource{},
+		}
+	case Xds:
+		source.ConfigSourceSpecifier = &envoy_config_core_v3.ConfigSource_ApiConfigSource{
+			ApiConfigSource: &envoy_config_core_v3.ApiConfigSource{
+				ApiType:                   envoy_config_core_v3.ApiConfigSource_GRPC,
+				SetNodeOnFirstMessageOnly: true,
+				GrpcServices: []*envoy_config_core_v3.GrpcService{{
+					TargetSpecifier: &envoy_config_core_v3.GrpcService_EnvoyGrpc_{
+						EnvoyGrpc: &envoy_config_core_v3.GrpcService_EnvoyGrpc{ClusterName: XdsCluster},
+					},
+				}},
+			},
+		}
+	case Rest:
+		source.ConfigSourceSpecifier = &envoy_config_core_v3.ConfigSource_ApiConfigSource{
+			ApiConfigSource: &envoy_config_core_v3.ApiConfigSource{
+				ApiType:      envoy_config_core_v3.ApiConfigSource_REST,
 				ClusterNames: []string{XdsCluster},
 				RefreshDelay: ptypes.DurationProto(RefreshDelay),
 			},
@@ -279,6 +317,117 @@ func MakeRuntime(runtimeName string) *discovery.Runtime {
 				},
 			},
 		},
+	}
+}
+
+// MakeV3Cluster creates a cluster using either ADS or EDS.
+func MakeV3Cluster(mode string, clusterName string) *envoy_config_cluster_v3.Cluster {
+	edsSource := configSourceV3(mode)
+
+	connectTimeout := 5 * time.Second
+	return &envoy_config_cluster_v3.Cluster{
+		Name:                 clusterName,
+		ConnectTimeout:       ptypes.DurationProto(connectTimeout),
+		ClusterDiscoveryType: &envoy_config_cluster_v3.Cluster_Type{Type: envoy_config_cluster_v3.Cluster_EDS},
+		EdsClusterConfig: &envoy_config_cluster_v3.Cluster_EdsClusterConfig{
+			EdsConfig: edsSource,
+		},
+	}
+}
+
+// MakeV3Route creates an HTTP route that routes to a given cluster.
+func MakeV3Route(routeName, clusterName string) *envoy_config_route_v3.RouteConfiguration {
+	return &envoy_config_route_v3.RouteConfiguration{
+		Name: routeName,
+		VirtualHosts: []*envoy_config_route_v3.VirtualHost{{
+			Name:    routeName,
+			Domains: []string{"*"},
+			Routes: []*envoy_config_route_v3.Route{{
+				Match: &envoy_config_route_v3.RouteMatch{
+					PathSpecifier: &envoy_config_route_v3.RouteMatch_Prefix{
+						Prefix: "/",
+					},
+				},
+				Action: &envoy_config_route_v3.Route_Route{
+					Route: &envoy_config_route_v3.RouteAction{
+						ClusterSpecifier: &envoy_config_route_v3.RouteAction_Cluster{
+							Cluster: clusterName,
+						},
+					},
+				},
+			}},
+		}},
+	}
+}
+
+// MakeV3HTTPListener creates a listener using either ADS or RDS for the route.
+func MakeV3HTTPListener(mode string, listenerName string, port uint32, route string) *envoy_config_listener_v3.Listener {
+	rdsSource := configSourceV3(mode)
+
+	// access log service configuration
+	alsConfig := &envoy_extensions_access_loggers_grpc_v3.HttpGrpcAccessLogConfig{
+		CommonConfig: &envoy_extensions_access_loggers_grpc_v3.CommonGrpcAccessLogConfig{
+			LogName: "echo",
+			GrpcService: &envoy_config_core_v3.GrpcService{
+				TargetSpecifier: &envoy_config_core_v3.GrpcService_EnvoyGrpc_{
+					EnvoyGrpc: &envoy_config_core_v3.GrpcService_EnvoyGrpc{
+						ClusterName: XdsCluster,
+					},
+				},
+			},
+		},
+	}
+	alsConfigPbst, err := ptypes.MarshalAny(alsConfig)
+	if err != nil {
+		panic(err)
+	}
+
+	// HTTP filter configuration
+	manager := &hcm_v3.HttpConnectionManager{
+		CodecType:  hcm_v3.HttpConnectionManager_AUTO,
+		StatPrefix: "http",
+		RouteSpecifier: &hcm_v3.HttpConnectionManager_Rds{
+			Rds: &hcm_v3.Rds{
+				ConfigSource:    rdsSource,
+				RouteConfigName: route,
+			},
+		},
+		HttpFilters: []*hcm_v3.HttpFilter{{
+			Name: wellknown.Router,
+		}},
+		AccessLog: []*envoy_config_accesslog_v3.AccessLog{{
+			Name: wellknown.HTTPGRPCAccessLog,
+			ConfigType: &envoy_config_accesslog_v3.AccessLog_TypedConfig{
+				TypedConfig: alsConfigPbst,
+			},
+		}},
+	}
+	pbst, err := ptypes.MarshalAny(manager)
+	if err != nil {
+		panic(err)
+	}
+
+	return &envoy_config_listener_v3.Listener{
+		Name: listenerName,
+		Address: &envoy_config_core_v3.Address{
+			Address: &envoy_config_core_v3.Address_SocketAddress{
+				SocketAddress: &envoy_config_core_v3.SocketAddress{
+					Protocol: envoy_config_core_v3.SocketAddress_TCP,
+					Address:  localhost,
+					PortSpecifier: &envoy_config_core_v3.SocketAddress_PortValue{
+						PortValue: port,
+					},
+				},
+			},
+		},
+		FilterChains: []*envoy_config_listener_v3.FilterChain{{
+			Filters: []*envoy_config_listener_v3.Filter{{
+				Name: wellknown.HTTPConnectionManager,
+				ConfigType: &envoy_config_listener_v3.Filter_TypedConfig{
+					TypedConfig: pbst,
+				},
+			}},
+		}},
 	}
 }
 

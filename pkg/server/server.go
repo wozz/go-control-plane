@@ -26,26 +26,39 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	v2grpc "github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
-	discoverygrpc "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+	envoy_api_v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	envoy_service_cluster_v3 "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
+	envoy_service_discovery_v2 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+	envoy_service_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	envoy_service_endpoint_v3 "github.com/envoyproxy/go-control-plane/envoy/service/endpoint/v3"
+	envoy_service_listener_v3 "github.com/envoyproxy/go-control-plane/envoy/service/listener/v3"
+	envoy_service_route_v3 "github.com/envoyproxy/go-control-plane/envoy/service/route/v3"
+	envoy_service_runtime_v3 "github.com/envoyproxy/go-control-plane/envoy/service/runtime/v3"
+	envoy_service_secret_v3 "github.com/envoyproxy/go-control-plane/envoy/service/secret/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/apiversions"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
 )
 
 // Server is a collection of handlers for streaming discovery requests.
 type Server interface {
-	v2grpc.EndpointDiscoveryServiceServer
-	v2grpc.ClusterDiscoveryServiceServer
-	v2grpc.RouteDiscoveryServiceServer
-	v2grpc.ListenerDiscoveryServiceServer
-	discoverygrpc.AggregatedDiscoveryServiceServer
-	discoverygrpc.SecretDiscoveryServiceServer
-	discoverygrpc.RuntimeDiscoveryServiceServer
+	envoy_api_v2.EndpointDiscoveryServiceServer
+	envoy_api_v2.ClusterDiscoveryServiceServer
+	envoy_api_v2.RouteDiscoveryServiceServer
+	envoy_api_v2.ListenerDiscoveryServiceServer
+	envoy_service_discovery_v2.AggregatedDiscoveryServiceServer
+	envoy_service_discovery_v2.SecretDiscoveryServiceServer
+	envoy_service_discovery_v2.RuntimeDiscoveryServiceServer
 
 	// Fetch is the universal fetch method.
-	Fetch(context.Context, *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error)
+	Fetch(context.Context, *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error)
+
+	V3() ServerV3
+
+	// RegisterAll is a helper to register all supported grpc services
+	RegisterAll(*grpc.Server)
 }
+
+var _ Server = (*server)(nil)
 
 // Callbacks is a collection of callbacks inserted into the server operation.
 // The callbacks are invoked synchronously.
@@ -57,19 +70,28 @@ type Callbacks interface {
 	OnStreamClosed(int64)
 	// OnStreamRequest is called once a request is received on a stream.
 	// Returning an error will end processing and close the stream. OnStreamClosed will still be called.
-	OnStreamRequest(int64, *v2.DiscoveryRequest) error
+	OnStreamRequest(int64, apiversions.DiscoveryRequest) error
 	// OnStreamResponse is called immediately prior to sending a response on a stream.
-	OnStreamResponse(int64, *v2.DiscoveryRequest, *v2.DiscoveryResponse)
+	OnStreamResponse(int64, apiversions.DiscoveryRequest, apiversions.DiscoveryResponse)
 	// OnFetchRequest is called for each Fetch request. Returning an error will end processing of the
 	// request and respond with an error.
-	OnFetchRequest(context.Context, *v2.DiscoveryRequest) error
+	OnFetchRequest(context.Context, apiversions.DiscoveryRequest) error
 	// OnFetchResponse is called immediately prior to sending a response.
-	OnFetchResponse(*v2.DiscoveryRequest, *v2.DiscoveryResponse)
+	OnFetchResponse(apiversions.DiscoveryRequest, apiversions.DiscoveryResponse)
 }
 
 // NewServer creates handlers from a config watcher and callbacks.
 func NewServer(ctx context.Context, config cache.Cache, callbacks Callbacks) Server {
-	return &server{cache: config, callbacks: callbacks, ctx: ctx}
+	s := &server{
+		cache:     config,
+		callbacks: callbacks,
+		ctx:       ctx,
+	}
+	sv3 := &serverV3{
+		s: s,
+	}
+	s.v3 = sv3
+	return s
 }
 
 type server struct {
@@ -79,13 +101,15 @@ type server struct {
 	// streamCount for counting bi-di streams
 	streamCount int64
 	ctx         context.Context
+
+	v3 ServerV3
 }
 
-type stream interface {
+type streamV2 interface {
 	grpc.ServerStream
 
-	Send(*v2.DiscoveryResponse) error
-	Recv() (*v2.DiscoveryRequest, error)
+	Send(*envoy_api_v2.DiscoveryResponse) error
+	Recv() (*envoy_api_v2.DiscoveryRequest, error)
 }
 
 // watches for all xDS resource types
@@ -134,7 +158,7 @@ func (values watches) Cancel() {
 	}
 }
 
-func createResponse(resp *cache.Response, typeURL string) (*v2.DiscoveryResponse, error) {
+func createResponse(resp *cache.Response, typeURL string, discoveryAPIVersion apiversions.APIVersion) (apiversions.DiscoveryResponse, error) {
 	if resp == nil {
 		return nil, errors.New("missing response")
 	}
@@ -166,16 +190,28 @@ func createResponse(resp *cache.Response, typeURL string) (*v2.DiscoveryResponse
 			}
 		}
 	}
-	out := &v2.DiscoveryResponse{
-		VersionInfo: resp.Version,
-		Resources:   resources,
-		TypeUrl:     typeURL,
+	var out apiversions.DiscoveryResponse
+	switch discoveryAPIVersion {
+	case apiversions.V2:
+		out = &envoy_api_v2.DiscoveryResponse{
+			VersionInfo: resp.Version,
+			Resources:   resources,
+			TypeUrl:     typeURL,
+		}
+	case apiversions.V3:
+		out = &envoy_service_discovery_v3.DiscoveryResponse{
+			VersionInfo: resp.Version,
+			Resources:   resources,
+			TypeUrl:     typeURL,
+		}
+	default:
+		return nil, errors.New("unknown api version in cache")
 	}
 	return out, nil
 }
 
 // process handles a bi-di stream request
-func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defaultTypeURL string) error {
+func (s *server) process(stream *stream, reqCh <-chan apiversions.DiscoveryRequest, defaultTypeURL string, discoveryAPIVersion apiversions.APIVersion) error {
 	// increment stream count
 	streamID := atomic.AddInt64(&s.streamCount, 1)
 
@@ -194,18 +230,20 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 
 	// sends a response by serializing to protobuf Any
 	send := func(resp cache.Response, typeURL string) (string, error) {
-		out, err := createResponse(&resp, typeURL)
+		out, err := createResponse(&resp, typeURL, discoveryAPIVersion)
 		if err != nil {
 			return "", err
 		}
 
 		// increment nonce
 		streamNonce = streamNonce + 1
-		out.Nonce = strconv.FormatInt(streamNonce, 10)
-		if s.callbacks != nil {
-			s.callbacks.OnStreamResponse(streamID, &resp.Request, out)
+		if err := setNonce(out, strconv.FormatInt(streamNonce, 10)); err != nil {
+			return "", err
 		}
-		return out.Nonce, stream.Send(out)
+		if s.callbacks != nil {
+			s.callbacks.OnStreamResponse(streamID, resp.Request, out)
+		}
+		return out.GetNonce(), stream.Send(out)
 	}
 
 	if s.callbacks != nil {
@@ -215,7 +253,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 	}
 
 	// node may only be set on the first discovery request
-	var node = &core.Node{}
+	node := &nodeCache{}
 
 	for {
 		select {
@@ -226,7 +264,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "endpoints watch failed")
 			}
-			nonce, err := send(resp, cache.EndpointType)
+			nonce, err := send(resp, cache.EndpointType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -236,7 +274,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "clusters watch failed")
 			}
-			nonce, err := send(resp, cache.ClusterType)
+			nonce, err := send(resp, cache.ClusterType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -246,7 +284,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "routes watch failed")
 			}
-			nonce, err := send(resp, cache.RouteType)
+			nonce, err := send(resp, cache.RouteType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -256,7 +294,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "listeners watch failed")
 			}
-			nonce, err := send(resp, cache.ListenerType)
+			nonce, err := send(resp, cache.ListenerType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -266,7 +304,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "secrets watch failed")
 			}
-			nonce, err := send(resp, cache.SecretType)
+			nonce, err := send(resp, cache.SecretType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -276,7 +314,7 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			if !more {
 				return status.Errorf(codes.Unavailable, "runtimes watch failed")
 			}
-			nonce, err := send(resp, cache.RuntimeType)
+			nonce, err := send(resp, cache.RuntimeType[resp.APIVersion])
 			if err != nil {
 				return err
 			}
@@ -292,22 +330,20 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 			}
 
 			// node field in discovery request is delta-compressed
-			if req.Node != nil {
-				node = req.Node
-			} else {
-				req.Node = node
-			}
+			node.update(req)
 
 			// nonces can be reused across streams; we verify nonce only if nonce is not initialized
 			nonce := req.GetResponseNonce()
 
 			// type URL is required for ADS but is implicit for xDS
 			if defaultTypeURL == cache.AnyType {
-				if req.TypeUrl == "" {
+				if req.GetTypeUrl() == "" {
 					return status.Errorf(codes.InvalidArgument, "type URL is required for ADS")
 				}
-			} else if req.TypeUrl == "" {
-				req.TypeUrl = defaultTypeURL
+			} else if req.GetTypeUrl() == "" {
+				if err := setTypeURL(req, defaultTypeURL); err != nil {
+					return err
+				}
 			}
 
 			if s.callbacks != nil {
@@ -318,49 +354,52 @@ func (s *server) process(stream stream, reqCh <-chan *v2.DiscoveryRequest, defau
 
 			// cancel existing watches to (re-)request a newer version
 			switch {
-			case req.TypeUrl == cache.EndpointType && (values.endpointNonce == "" || values.endpointNonce == nonce):
+			case cache.EndpointType.Includes(req.GetTypeUrl()) && (values.endpointNonce == "" || values.endpointNonce == nonce):
 				if values.endpointCancel != nil {
 					values.endpointCancel()
 				}
-				values.endpoints, values.endpointCancel = s.cache.CreateWatch(*req)
-			case req.TypeUrl == cache.ClusterType && (values.clusterNonce == "" || values.clusterNonce == nonce):
+				values.endpoints, values.endpointCancel = s.cache.CreateWatch(req)
+			case cache.ClusterType.Includes(req.GetTypeUrl()) && (values.clusterNonce == "" || values.clusterNonce == nonce):
 				if values.clusterCancel != nil {
 					values.clusterCancel()
 				}
-				values.clusters, values.clusterCancel = s.cache.CreateWatch(*req)
-			case req.TypeUrl == cache.RouteType && (values.routeNonce == "" || values.routeNonce == nonce):
+				values.clusters, values.clusterCancel = s.cache.CreateWatch(req)
+			case cache.RouteType.Includes(req.GetTypeUrl()) && (values.routeNonce == "" || values.routeNonce == nonce):
 				if values.routeCancel != nil {
 					values.routeCancel()
 				}
-				values.routes, values.routeCancel = s.cache.CreateWatch(*req)
-			case req.TypeUrl == cache.ListenerType && (values.listenerNonce == "" || values.listenerNonce == nonce):
+				values.routes, values.routeCancel = s.cache.CreateWatch(req)
+			case cache.ListenerType.Includes(req.GetTypeUrl()) && (values.listenerNonce == "" || values.listenerNonce == nonce):
 				if values.listenerCancel != nil {
 					values.listenerCancel()
 				}
-				values.listeners, values.listenerCancel = s.cache.CreateWatch(*req)
-			case req.TypeUrl == cache.SecretType && (values.secretNonce == "" || values.secretNonce == nonce):
+				values.listeners, values.listenerCancel = s.cache.CreateWatch(req)
+			case cache.SecretType.Includes(req.GetTypeUrl()) && (values.secretNonce == "" || values.secretNonce == nonce):
 				if values.secretCancel != nil {
 					values.secretCancel()
 				}
-				values.secrets, values.secretCancel = s.cache.CreateWatch(*req)
-			case req.TypeUrl == cache.RuntimeType && (values.runtimeNonce == "" || values.runtimeNonce == nonce):
+				values.secrets, values.secretCancel = s.cache.CreateWatch(req)
+			case cache.RuntimeType.Includes(req.GetTypeUrl()) && (values.runtimeNonce == "" || values.runtimeNonce == nonce):
 				if values.runtimeCancel != nil {
 					values.runtimeCancel()
 				}
-				values.runtimes, values.runtimeCancel = s.cache.CreateWatch(*req)
+				values.runtimes, values.runtimeCancel = s.cache.CreateWatch(req)
 			}
 		}
 	}
 }
 
-// handler converts a blocking read call to channels and initiates stream processing
-func (s *server) handler(stream stream, typeURL string) error {
+// handlerV2 converts a blocking read call to channels and initiates stream processing
+func (s *server) handlerV2(s2 streamV2, typeURL string) error {
 	// a channel for receiving incoming requests
-	reqCh := make(chan *v2.DiscoveryRequest)
+	reqCh := make(chan apiversions.DiscoveryRequest)
 	reqStop := int32(0)
+	st := &stream{
+		s2: s2,
+	}
 	go func() {
 		for {
-			req, err := stream.Recv()
+			req, err := st.Recv(apiversions.V2)
 			if atomic.LoadInt32(&reqStop) != 0 {
 				return
 			}
@@ -372,7 +411,7 @@ func (s *server) handler(stream stream, typeURL string) error {
 		}
 	}()
 
-	err := s.process(stream, reqCh, typeURL)
+	err := s.process(st, reqCh, typeURL, apiversions.V2)
 
 	// prevents writing to a closed channel if send failed on blocked recv
 	// TODO(kuat) figure out how to unblock recv through gRPC API
@@ -381,124 +420,155 @@ func (s *server) handler(stream stream, typeURL string) error {
 	return err
 }
 
-func (s *server) StreamAggregatedResources(stream discoverygrpc.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
-	return s.handler(stream, cache.AnyType)
+func (s *server) StreamAggregatedResources(stream envoy_service_discovery_v2.AggregatedDiscoveryService_StreamAggregatedResourcesServer) error {
+	return s.handlerV2(stream, cache.AnyType)
 }
 
-func (s *server) StreamEndpoints(stream v2grpc.EndpointDiscoveryService_StreamEndpointsServer) error {
-	return s.handler(stream, cache.EndpointType)
+func (s *server) StreamEndpoints(stream envoy_api_v2.EndpointDiscoveryService_StreamEndpointsServer) error {
+	return s.handlerV2(stream, cache.EndpointType[apiversions.V2])
 }
 
-func (s *server) StreamClusters(stream v2grpc.ClusterDiscoveryService_StreamClustersServer) error {
-	return s.handler(stream, cache.ClusterType)
+func (s *server) StreamClusters(stream envoy_api_v2.ClusterDiscoveryService_StreamClustersServer) error {
+	return s.handlerV2(stream, cache.ClusterType[apiversions.V2])
 }
 
-func (s *server) StreamRoutes(stream v2grpc.RouteDiscoveryService_StreamRoutesServer) error {
-	return s.handler(stream, cache.RouteType)
+func (s *server) StreamRoutes(stream envoy_api_v2.RouteDiscoveryService_StreamRoutesServer) error {
+	return s.handlerV2(stream, cache.RouteType[apiversions.V2])
 }
 
-func (s *server) StreamListeners(stream v2grpc.ListenerDiscoveryService_StreamListenersServer) error {
-	return s.handler(stream, cache.ListenerType)
+func (s *server) StreamListeners(stream envoy_api_v2.ListenerDiscoveryService_StreamListenersServer) error {
+	return s.handlerV2(stream, cache.ListenerType[apiversions.V2])
 }
 
-func (s *server) StreamSecrets(stream discoverygrpc.SecretDiscoveryService_StreamSecretsServer) error {
-	return s.handler(stream, cache.SecretType)
+func (s *server) StreamSecrets(stream envoy_service_discovery_v2.SecretDiscoveryService_StreamSecretsServer) error {
+	return s.handlerV2(stream, cache.SecretType[apiversions.V2])
 }
 
-func (s *server) StreamRuntime(stream discoverygrpc.RuntimeDiscoveryService_StreamRuntimeServer) error {
-	return s.handler(stream, cache.RuntimeType)
+func (s *server) StreamRuntime(stream envoy_service_discovery_v2.RuntimeDiscoveryService_StreamRuntimeServer) error {
+	return s.handlerV2(stream, cache.RuntimeType[apiversions.V2])
 }
 
 // Fetch is the universal fetch method.
-func (s *server) Fetch(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) Fetch(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if s.callbacks != nil {
 		if err := s.callbacks.OnFetchRequest(ctx, req); err != nil {
 			return nil, err
 		}
 	}
-	resp, err := s.cache.Fetch(ctx, *req)
+	resp, err := s.cache.Fetch(ctx, req)
 	if err != nil {
 		return nil, err
 	}
-	out, err := createResponse(resp, req.TypeUrl)
+	out, err := createResponse(resp, req.GetTypeUrl(), apiversions.V2)
 	if s.callbacks != nil {
 		s.callbacks.OnFetchResponse(req, out)
 	}
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	typedOut, ok := out.(*envoy_api_v2.DiscoveryResponse)
+	if !ok {
+		return nil, errors.New("internal error, invalid type for api version")
+	}
+	return typedOut, nil
 }
 
-func (s *server) FetchEndpoints(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchEndpoints(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.EndpointType
+	req.TypeUrl = cache.EndpointType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) FetchClusters(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchClusters(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.ClusterType
+	req.TypeUrl = cache.ClusterType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) FetchRoutes(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchRoutes(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.RouteType
+	req.TypeUrl = cache.RouteType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) FetchListeners(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchListeners(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.ListenerType
+	req.TypeUrl = cache.ListenerType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) FetchSecrets(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchSecrets(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.SecretType
+	req.TypeUrl = cache.SecretType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) FetchRuntime(ctx context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+func (s *server) FetchRuntime(ctx context.Context, req *envoy_api_v2.DiscoveryRequest) (*envoy_api_v2.DiscoveryResponse, error) {
 	if req == nil {
 		return nil, status.Errorf(codes.Unavailable, "empty request")
 	}
-	req.TypeUrl = cache.RuntimeType
+	req.TypeUrl = cache.RuntimeType[apiversions.V2]
 	return s.Fetch(ctx, req)
 }
 
-func (s *server) DeltaAggregatedResources(_ discoverygrpc.AggregatedDiscoveryService_DeltaAggregatedResourcesServer) error {
+func (s *server) DeltaAggregatedResources(_ envoy_service_discovery_v2.AggregatedDiscoveryService_DeltaAggregatedResourcesServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaEndpoints(_ v2grpc.EndpointDiscoveryService_DeltaEndpointsServer) error {
+func (s *server) DeltaEndpoints(_ envoy_api_v2.EndpointDiscoveryService_DeltaEndpointsServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaClusters(_ v2grpc.ClusterDiscoveryService_DeltaClustersServer) error {
+func (s *server) DeltaClusters(_ envoy_api_v2.ClusterDiscoveryService_DeltaClustersServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaRoutes(_ v2grpc.RouteDiscoveryService_DeltaRoutesServer) error {
+func (s *server) DeltaRoutes(_ envoy_api_v2.RouteDiscoveryService_DeltaRoutesServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaListeners(_ v2grpc.ListenerDiscoveryService_DeltaListenersServer) error {
+func (s *server) DeltaListeners(_ envoy_api_v2.ListenerDiscoveryService_DeltaListenersServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaSecrets(_ discoverygrpc.SecretDiscoveryService_DeltaSecretsServer) error {
+func (s *server) DeltaSecrets(_ envoy_service_discovery_v2.SecretDiscoveryService_DeltaSecretsServer) error {
 	return errors.New("not implemented")
 }
 
-func (s *server) DeltaRuntime(_ discoverygrpc.RuntimeDiscoveryService_DeltaRuntimeServer) error {
+func (s *server) DeltaRuntime(_ envoy_service_discovery_v2.RuntimeDiscoveryService_DeltaRuntimeServer) error {
 	return errors.New("not implemented")
+}
+
+func (s *server) V3() ServerV3 {
+	return s.v3
+}
+
+func (s *server) RegisterAll(grpcServer *grpc.Server) {
+	// v2 APIs
+	envoy_service_discovery_v2.RegisterAggregatedDiscoveryServiceServer(grpcServer, s)
+	envoy_api_v2.RegisterEndpointDiscoveryServiceServer(grpcServer, s)
+	envoy_api_v2.RegisterClusterDiscoveryServiceServer(grpcServer, s)
+	envoy_api_v2.RegisterRouteDiscoveryServiceServer(grpcServer, s)
+	envoy_api_v2.RegisterListenerDiscoveryServiceServer(grpcServer, s)
+	envoy_service_discovery_v2.RegisterSecretDiscoveryServiceServer(grpcServer, s)
+	envoy_service_discovery_v2.RegisterRuntimeDiscoveryServiceServer(grpcServer, s)
+
+	// v3 APIs
+	envoy_service_discovery_v3.RegisterAggregatedDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_endpoint_v3.RegisterEndpointDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_cluster_v3.RegisterClusterDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_route_v3.RegisterRouteDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_listener_v3.RegisterListenerDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_secret_v3.RegisterSecretDiscoveryServiceServer(grpcServer, s.V3())
+	envoy_service_runtime_v3.RegisterRuntimeDiscoveryServiceServer(grpcServer, s.V3())
 }

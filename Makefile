@@ -9,7 +9,7 @@ BINDIR	:= bin
 PKG 		:= github.com/envoyproxy/go-control-plane
 
 .PHONY: build
-build:
+build: pkg/apiversions/apiversion_string.go
 	@go build ./pkg/... ./envoy/...
 
 .PHONY: test
@@ -23,6 +23,9 @@ cover:
 .PHONY: format
 format:
 	@goimports -local $(PKG) -w -l pkg
+
+pkg/apiversions/apiversion_string.go: pkg/apiversions/versions.go
+	go generate ./pkg/apiversions/
 
 #-----------------
 #-- integration

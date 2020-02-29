@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/envoyproxy/go-control-plane/pkg/apiversions"
 	"github.com/envoyproxy/go-control-plane/pkg/log"
 )
 
@@ -107,12 +108,13 @@ func (cache *snapshotCache) SetSnapshot(node string, snapshot Snapshot) error {
 	if info, ok := cache.status[node]; ok {
 		info.mu.Lock()
 		for id, watch := range info.watches {
-			version := snapshot.GetVersion(watch.Request.TypeUrl)
-			if version != watch.Request.VersionInfo {
+			version := snapshot.GetVersion(watch.Request.GetTypeUrl())
+			if version != watch.Request.GetVersionInfo() {
+				apiVersion := getAPIVersion(watch.Request.GetTypeUrl())
 				if cache.log != nil {
-					cache.log.Debugf("respond open watch %d%v with new version %q", id, watch.Request.ResourceNames, version)
+					cache.log.Debugf("respond open watch %d%v with new version %q, apiVersion: %s", id, watch.Request.GetResourceNames(), version, apiVersion)
 				}
-				cache.respond(watch.Request, watch.Response, snapshot.GetResources(watch.Request.TypeUrl), version)
+				cache.respond(watch.Request, watch.Response, snapshot.GetResources(watch.Request.GetTypeUrl()), version, apiVersion)
 
 				// discard the watch
 				delete(info.watches, id)
@@ -166,14 +168,14 @@ func superset(names map[string]bool, resources map[string]Resource) error {
 
 // CreateWatch returns a watch for an xDS request.
 func (cache *snapshotCache) CreateWatch(request Request) (chan Response, func()) {
-	nodeID := cache.hash.ID(request.Node)
+	nodeID := cache.hash.ID(request)
 
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 
 	info, ok := cache.status[nodeID]
 	if !ok {
-		info = newStatusInfo(request.Node)
+		info = newStatusInfo(request)
 		cache.status[nodeID] = info
 	}
 
@@ -186,14 +188,15 @@ func (cache *snapshotCache) CreateWatch(request Request) (chan Response, func())
 	value := make(chan Response, 1)
 
 	snapshot, exists := cache.snapshots[nodeID]
-	version := snapshot.GetVersion(request.TypeUrl)
+	version := snapshot.GetVersion(request.GetTypeUrl())
+	apiVersion := getAPIVersion(request.GetTypeUrl())
 
 	// if the requested version is up-to-date or missing a response, leave an open watch
-	if !exists || request.VersionInfo == version {
+	if !exists || request.GetVersionInfo() == version {
 		watchID := cache.nextWatchID()
 		if cache.log != nil {
-			cache.log.Debugf("open watch %d for %s%v from nodeID %q, version %q", watchID,
-				request.TypeUrl, request.ResourceNames, nodeID, request.VersionInfo)
+			cache.log.Debugf("open watch %d for %s%v from nodeID %q, version %q, apiVersion: %s", watchID,
+				request.GetTypeUrl(), request.GetResourceNames(), nodeID, request.GetVersionInfo(), apiVersion)
 		}
 		info.mu.Lock()
 		info.watches[watchID] = ResponseWatch{Request: request, Response: value}
@@ -202,7 +205,7 @@ func (cache *snapshotCache) CreateWatch(request Request) (chan Response, func())
 	}
 
 	// otherwise, the watch may be responded immediately
-	cache.respond(request, value, snapshot.GetResources(request.TypeUrl), version)
+	cache.respond(request, value, snapshot.GetResources(request.GetTypeUrl()), version, apiVersion)
 
 	return value, nil
 }
@@ -227,11 +230,11 @@ func (cache *snapshotCache) cancelWatch(nodeID string, watchID int64) func() {
 
 // Respond to a watch with the snapshot value. The value channel should have capacity not to block.
 // TODO(kuat) do not respond always, see issue https://github.com/envoyproxy/go-control-plane/issues/46
-func (cache *snapshotCache) respond(request Request, value chan Response, resources map[string]Resource, version string) {
+func (cache *snapshotCache) respond(request Request, value chan Response, resources map[string]Resource, version string, apiVersion apiversions.APIVersion) {
 	// for ADS, the request names must match the snapshot names
 	// if they do not, then the watch is never responded, and it is expected that envoy makes another request
-	if len(request.ResourceNames) != 0 && cache.ads {
-		if err := superset(nameSet(request.ResourceNames), resources); err != nil {
+	if len(request.GetResourceNames()) != 0 && cache.ads {
+		if err := superset(nameSet(request.GetResourceNames()), resources); err != nil {
 			if cache.log != nil {
 				cache.log.Debugf("ADS mode: not responding to request: %v", err)
 			}
@@ -239,21 +242,21 @@ func (cache *snapshotCache) respond(request Request, value chan Response, resour
 		}
 	}
 	if cache.log != nil {
-		cache.log.Debugf("respond %s%v version %q with version %q",
-			request.TypeUrl, request.ResourceNames, request.VersionInfo, version)
+		cache.log.Debugf("respond %s%v version %q with version %q, apiVersion: %s",
+			request.GetTypeUrl(), request.GetResourceNames(), request.GetVersionInfo(), version, apiVersion)
 	}
 
-	value <- createResponse(request, resources, version)
+	value <- createResponse(request, resources, version, apiVersion)
 }
 
-func createResponse(request Request, resources map[string]Resource, version string) Response {
+func createResponse(request Request, resources map[string]Resource, version string, apiVersion apiversions.APIVersion) Response {
 	filtered := make([]Resource, 0, len(resources))
 
 	// Reply only with the requested resources. Envoy may ask each resource
 	// individually in a separate stream. It is ok to reply with the same version
 	// on separate streams since requests do not share their response versions.
-	if len(request.ResourceNames) != 0 {
-		set := nameSet(request.ResourceNames)
+	if len(request.GetResourceNames()) != 0 {
+		set := nameSet(request.GetResourceNames())
 		for name, resource := range resources {
 			if set[name] {
 				filtered = append(filtered, resource)
@@ -266,16 +269,17 @@ func createResponse(request Request, resources map[string]Resource, version stri
 	}
 
 	return Response{
-		Request:   request,
-		Version:   version,
-		Resources: filtered,
+		Request:    request,
+		Version:    version,
+		APIVersion: apiVersion,
+		Resources:  filtered,
 	}
 }
 
 // Fetch implements the cache fetch function.
 // Fetch is called on multiple streams, so responding to individual names with the same version works.
 func (cache *snapshotCache) Fetch(ctx context.Context, request Request) (*Response, error) {
-	nodeID := cache.hash.ID(request.Node)
+	nodeID := cache.hash.ID(request)
 
 	cache.mu.RLock()
 	defer cache.mu.RUnlock()
@@ -283,16 +287,17 @@ func (cache *snapshotCache) Fetch(ctx context.Context, request Request) (*Respon
 	if snapshot, exists := cache.snapshots[nodeID]; exists {
 		// Respond only if the request version is distinct from the current snapshot state.
 		// It might be beneficial to hold the request since Envoy will re-attempt the refresh.
-		version := snapshot.GetVersion(request.TypeUrl)
-		if request.VersionInfo == version {
+		version := snapshot.GetVersion(request.GetTypeUrl())
+		if request.GetVersionInfo() == version {
 			if cache.log != nil {
 				cache.log.Warnf("skip fetch: version up to date")
 			}
 			return nil, &SkipFetchError{}
 		}
 
-		resources := snapshot.GetResources(request.TypeUrl)
-		out := createResponse(request, resources, version)
+		resources := snapshot.GetResources(request.GetTypeUrl())
+		apiVersion := getAPIVersion(request.GetTypeUrl())
+		out := createResponse(request, resources, version, apiVersion)
 		return &out, nil
 	}
 

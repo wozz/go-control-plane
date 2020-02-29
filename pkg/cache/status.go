@@ -18,24 +18,32 @@ import (
 	"sync"
 	"time"
 
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	envoy_api_v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	envoy_api_v2_core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	envoy_config_core_v3 "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	envoy_service_discovery_v3 "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
+	"github.com/envoyproxy/go-control-plane/pkg/apiversions"
 )
 
 // NodeHash computes string identifiers for Envoy nodes.
 type NodeHash interface {
 	// ID function defines a unique string identifier for the remote Envoy node.
-	ID(node *core.Node) string
+	ID(req apiversions.DiscoveryRequest) string
 }
 
 // IDHash uses ID field as the node hash.
 type IDHash struct{}
 
 // ID uses the node ID field
-func (IDHash) ID(node *core.Node) string {
-	if node == nil {
+func (IDHash) ID(req apiversions.DiscoveryRequest) string {
+	switch r := req.(type) {
+	case *envoy_api_v2.DiscoveryRequest:
+		return r.GetNode().GetId()
+	case *envoy_service_discovery_v3.DiscoveryRequest:
+		return r.GetNode().GetId()
+	default:
 		return ""
 	}
-	return node.Id
 }
 
 var _ NodeHash = IDHash{}
@@ -43,8 +51,11 @@ var _ NodeHash = IDHash{}
 // StatusInfo tracks the server state for the remote Envoy node.
 // Not all fields are used by all cache implementations.
 type StatusInfo interface {
-	// GetNode returns the node metadata.
-	GetNode() *core.Node
+	// GetNodeV2 returns the v2 node metadata if available
+	GetNodeV2() *envoy_api_v2_core.Node
+
+	// GetNodeV3 returns the v3 node metadata if available
+	GetNodeV3() *envoy_config_core_v3.Node
 
 	// GetNumWatches returns the number of open watches.
 	GetNumWatches() int
@@ -54,8 +65,11 @@ type StatusInfo interface {
 }
 
 type statusInfo struct {
-	// node is the constant Envoy node metadata.
-	node *core.Node
+	// nodeV2 is the constant Envoy node v2 metadata.
+	nodeV2 *envoy_api_v2_core.Node
+
+	// nodeV3 is the constant Envoy node v3 metadata.
+	nodeV3 *envoy_config_core_v3.Node
 
 	// watches are indexed channels for the response watches and the original requests.
 	watches map[int64]ResponseWatch
@@ -78,18 +92,29 @@ type ResponseWatch struct {
 }
 
 // newStatusInfo initializes a status info data structure.
-func newStatusInfo(node *core.Node) *statusInfo {
+func newStatusInfo(req apiversions.DiscoveryRequest) *statusInfo {
 	out := statusInfo{
-		node:    node,
 		watches: make(map[int64]ResponseWatch),
+	}
+	switch r := req.(type) {
+	case *envoy_api_v2.DiscoveryRequest:
+		out.nodeV2 = r.Node
+	case *envoy_service_discovery_v3.DiscoveryRequest:
+		out.nodeV3 = r.Node
 	}
 	return &out
 }
 
-func (info *statusInfo) GetNode() *core.Node {
+func (info *statusInfo) GetNodeV2() *envoy_api_v2_core.Node {
 	info.mu.RLock()
 	defer info.mu.RUnlock()
-	return info.node
+	return info.nodeV2
+}
+
+func (info *statusInfo) GetNodeV3() *envoy_config_core_v3.Node {
+	info.mu.RLock()
+	defer info.mu.RUnlock()
+	return info.nodeV3
 }
 
 func (info *statusInfo) GetNumWatches() int {

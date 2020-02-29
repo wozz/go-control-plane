@@ -18,12 +18,18 @@ import (
 	"reflect"
 	"testing"
 
-	core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	envoy_api_v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	envoy_api_v2_core "github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 )
 
 func TestIDHash(t *testing.T) {
-	node := &core.Node{Id: "test"}
-	if got := (IDHash{}).ID(node); got != "test" {
+	node := &envoy_api_v2_core.Node{
+		Id: "test",
+	}
+	req := &envoy_api_v2.DiscoveryRequest{
+		Node: node,
+	}
+	if got := (IDHash{}).ID(req); got != "test" {
 		t.Errorf("IDHash.ID(%v) => got %s, want %s", node, got, node.Id)
 	}
 	if got := (IDHash{}).ID(nil); got != "" {
@@ -32,10 +38,15 @@ func TestIDHash(t *testing.T) {
 }
 
 func TestNewStatusInfo(t *testing.T) {
-	node := &core.Node{Id: "test"}
-	info := newStatusInfo(node)
+	node := &envoy_api_v2_core.Node{
+		Id: "test",
+	}
+	req := &envoy_api_v2.DiscoveryRequest{
+		Node: node,
+	}
+	info := newStatusInfo(req)
 
-	if got := info.GetNode(); !reflect.DeepEqual(got, node) {
+	if got := info.GetNodeV2(); !reflect.DeepEqual(got, node) {
 		t.Errorf("GetNode() => got %#v, want %#v", got, node)
 	}
 

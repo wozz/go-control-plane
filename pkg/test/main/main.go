@@ -27,11 +27,10 @@ import (
 	"sync"
 	"time"
 
-	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	"github.com/envoyproxy/go-control-plane/pkg/apiversions"
 	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/envoyproxy/go-control-plane/pkg/server"
 	"github.com/envoyproxy/go-control-plane/pkg/test"
-
 	"github.com/envoyproxy/go-control-plane/pkg/test/resource"
 )
 
@@ -263,7 +262,7 @@ func (cb *callbacks) OnStreamClosed(id int64) {
 		log.Printf("stream %d closed\n", id)
 	}
 }
-func (cb *callbacks) OnStreamRequest(int64, *v2.DiscoveryRequest) error {
+func (cb *callbacks) OnStreamRequest(int64, apiversions.DiscoveryRequest) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.requests++
@@ -273,8 +272,9 @@ func (cb *callbacks) OnStreamRequest(int64, *v2.DiscoveryRequest) error {
 	}
 	return nil
 }
-func (cb *callbacks) OnStreamResponse(int64, *v2.DiscoveryRequest, *v2.DiscoveryResponse) {}
-func (cb *callbacks) OnFetchRequest(_ context.Context, req *v2.DiscoveryRequest) error {
+func (cb *callbacks) OnStreamResponse(int64, apiversions.DiscoveryRequest, apiversions.DiscoveryResponse) {
+}
+func (cb *callbacks) OnFetchRequest(_ context.Context, req apiversions.DiscoveryRequest) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 	cb.fetches++
@@ -284,4 +284,4 @@ func (cb *callbacks) OnFetchRequest(_ context.Context, req *v2.DiscoveryRequest)
 	}
 	return nil
 }
-func (cb *callbacks) OnFetchResponse(*v2.DiscoveryRequest, *v2.DiscoveryResponse) {}
+func (cb *callbacks) OnFetchResponse(apiversions.DiscoveryRequest, apiversions.DiscoveryResponse) {}
